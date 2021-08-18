@@ -1,7 +1,7 @@
 -- declare excute_day date;
 -- set excute_day = date('2021-07-11');
 
-truncate table `chaingraph-318604.btc_tags.generated_tags`;
+-- truncate table `chaingraph-318604.btc_tags.generated_tags`;
 insert into `chaingraph-318604.btc_tags.generated_tags` 
 
 with
@@ -87,7 +87,7 @@ common_input as
         b.ref_address,
         'common input' as relation,
         1 as idx,
-        case when input_count <= 3 then 1 else 3 / input_count end as sub_weight
+        case when input_count <= 3 then 1 else 3 / input_count * base_score end as sub_weight
     from
         tx_inputs a left join
     (
@@ -95,6 +95,7 @@ common_input as
             `hash`,
             plots,
             any_value(address) as ref_address,
+            max(score) as base_score,
         from taged_transfers_input group by `hash`, plots
     ) b using(`hash`) where b.plots is not null and a.address != b.ref_address
 ),
@@ -108,7 +109,7 @@ common_output as
         b.ref_address,
         'common output' as relation,
         2 as idx,
-        case when output_count <= 3 then 1 else 3 / output_count end as sub_weight
+        case when output_count <= 3 then 1 else 3 / output_count * base_score end as sub_weight
     from
         tx_outputs a left join
         (
@@ -116,6 +117,7 @@ common_output as
                 `hash`,
                 plots,
                 any_value(address) as ref_address,
+                max(score) as base_score,
             from taged_transfers_output group by `hash`, plots
         ) b using(`hash`) where b.plots is not null and a.address != b.ref_address 
 ),
@@ -129,6 +131,7 @@ direct_source as
         a.spent_usd_value * (b.value / a.total_in) as source_usd_value, --input value allocated to the target output.
         a.value * (b.value / a.total_in) as source_value,
         b.plots,
+        b.base_score,
         b.address as ref_address,
         a.spent_transaction_hash,
         a.spent_output_index
@@ -136,15 +139,16 @@ direct_source as
         tx_inputs a 
     inner join 
         (
-            select distinct 
+            select
                 address,
                 `hash`,
                 `index`,
-                value,
-                receive_usd_value,
-                plots
+                any_value(value) as value,
+                any_value(receive_usd_value) as receive_usd_value,
+                plots,
+                max(score) as base_score
             from
-            taged_transfers_output
+            taged_transfers_output group by address, `hash`, `index`, plots
         ) b
     on a.`hash` = b.`hash`
     where b.plots is not null and a.address != b.address and a.total_in > 0
@@ -157,7 +161,7 @@ direct_source_score as
         plots,
         'direct source' as relation,
         3 as idx,
-        sum(total_usd_value / total_spent_usd * 
+        sum(total_usd_value / total_spent_usd * base_score * 
             (case when total_usd_value > 10000 then 1 else total_usd_value / 10000 end)) as sub_weight
     from 
     (
@@ -165,14 +169,16 @@ direct_source_score as
             address,
             plots,
             -- sum(value) as total_value,
-            sum(source_usd_value) as total_usd_value
+            sum(source_usd_value) as total_usd_value,
+            max(base_score) as base_score
         FROM (
             select 
                 `hash`,
                 address,
                 plots,
                 -- any_value(value) as value,
-                any_value(source_usd_value) as source_usd_value
+                any_value(source_usd_value) as source_usd_value,
+                max(base_score) as base_score
             from
                 direct_source group by `hash`, address, plots
          ) group by address, plots
@@ -191,6 +197,7 @@ direct_dest as
         a.value * (b.value / b.total_in) as dest_value,
         a.receive_usd_value,
         b.value as value_out,
+        b.base_score,
         b.plots,
         b.address as ref_address,
         a.index
@@ -200,12 +207,13 @@ direct_dest as
         (
             select distinct 
                 address,
-                total_in,
+                any_value(total_in) as total_in,
                 `hash`,
-                value,
-                plots
+                any_value(value) as value,
+                plots,
+                max(score) as base_score
             from
-            taged_transfers_input
+            taged_transfers_input group by address, `hash`, plots
         ) b 
     on a.`hash` = b.`hash`
     where b.plots is not null and a.address != b.address  
@@ -218,19 +226,21 @@ direct_dest_score as
         plots,
         'direct dest' as relation,
         4 as idx,
-        max(total_usd_value / total_receive_usd * (case when total_usd_value > 10000 then 1 else total_usd_value / 10000 end)) as sub_weight
+        max(total_usd_value / total_receive_usd * base_score * (case when total_usd_value > 10000 then 1 else total_usd_value / 10000 end)) as sub_weight
     from 
     (
         SELECT 
             address,
             plots,
-            sum(usd_value) as total_usd_value
+            sum(usd_value) as total_usd_value,
+            max(base_score) as base_score
         FROM (
             select 
                 `hash`,
                 address,
                 plots,
-                any_value(receive_usd_value) as usd_value
+                any_value(receive_usd_value) as usd_value,
+                max(base_score) as base_score
             from
                 direct_dest group by `hash`, address, plots
         ) group by address, plots
@@ -252,6 +262,7 @@ indirect_source as
         a.total_in,
         a.spent_usd_value * b.source_value / a.total_in as source_usd_value, --spent value allocated to the target.
         b.plots,
+        b.base_score
     from 
         tx_inputs a 
     left join 
@@ -261,7 +272,8 @@ indirect_source as
             a.address as ref_address2,
             a.plots,
             a.source_value,
-            b.hash
+            b.hash,
+            a.base_score
         from 
         direct_source a right join tx_outputs b on a.spent_transaction_hash = b.hash and a.spent_output_index = b.index 
         where a.spent_transaction_hash is not null and a.spent_output_index is not null
@@ -275,7 +287,7 @@ indirect_source_score as
         plots,
         5 as idx,
         'indirect source' as relation,
-        sum(total_usd_value / total_spent_usd * 
+        sum(total_usd_value / total_spent_usd * base_score *
             (case when total_usd_value > 10000 then 1 else total_usd_value / 10000 end)) as sub_weight,
     from 
     (
@@ -283,13 +295,15 @@ indirect_source_score as
             address,
             plots,
             -- sum(value) as total_value,
-            sum(source_usd_value) as total_usd_value
+            sum(source_usd_value) as total_usd_value,
+            max(base_score) as base_score
         FROM (
             select
                 `hash`,
                 address,
                 plots,
-                any_value(source_usd_value) as source_usd_value
+                any_value(source_usd_value) as source_usd_value,
+                max(base_score) as base_score
             from
                 indirect_source group by `hash`, address, plots
          ) group by address, plots
@@ -310,7 +324,8 @@ indirect_dest as
         b.total_in,
         b.dest_value as ref_dest_value,
         a.receive_usd_value * b.dest_value / b.total_in as dest_usd_value, --receive value from target.
-        b.plots
+        b.plots,
+        base_score 
     from 
         tx_outputs a 
     left join 
@@ -321,7 +336,8 @@ indirect_dest as
             a.plots,
             a.dest_value,
             b.hash,
-            b.total_in
+            b.total_in,
+            a.base_score
         from 
         direct_dest a right join tx_inputs b 
         on a.hash = b.spent_transaction_hash 
@@ -337,20 +353,22 @@ indirect_dest_score as
         plots,
         6 as idx,
         'indirect dest' as relation,
-        sum(total_usd_value / total_receive_usd * 
+        sum(total_usd_value / total_receive_usd * base_score *
             (case when total_usd_value > 10000 then 1 else total_usd_value / 10000 end)) as sub_weight,
     from 
     (
         SELECT 
             address,
             plots,
-            sum(dest_usd_value) as total_usd_value
+            sum(dest_usd_value) as total_usd_value,
+            max(base_score) as base_score
         FROM (
             select
                 `hash`,
                 address,
                 plots,
-                any_value(dest_usd_value) as dest_usd_value
+                any_value(dest_usd_value) as dest_usd_value,
+                max(base_score) as base_score
             from
                 indirect_dest group by `hash`, address, plots
          ) group by address, plots
